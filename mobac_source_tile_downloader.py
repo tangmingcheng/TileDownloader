@@ -264,8 +264,9 @@ def download_range_for_layer(
     if not world and bbox is None and (xrange_ is None or yrange_ is None):
         raise SystemExit("必须提供 --bbox 或 --xrange/--yrange；若要全世界请显式加 --world")
 
-    # build per zoom ranges
-    jobs: List[Tuple[int,int,int]] = []  # (z,x,y)
+    # build per zoom ranges (只存范围，不存海量 jobs，避免 z=15 级别时内存爆炸)
+    ranges: List[Tuple[int, int, int, int, int]] = []  # (z, x_min, x_max, y_min, y_max)
+    total = 0
     for z in zooms:
         if z < layer.min_zoom or z > layer.max_zoom:
             print(f"[skip] zoom {z} out of layer range [{layer.min_zoom},{layer.max_zoom}] for layer={layer.name}")
@@ -286,16 +287,14 @@ def download_range_for_layer(
 
         count = (x_max - x_min + 1) * (y_max - y_min + 1)
         print(f"[plan] layer={layer.name} z={z} x=[{x_min},{x_max}] y=[{y_min},{y_max}] tiles={count}")
-        for x in range(x_min, x_max + 1):
-            for y in range(y_min, y_max + 1):
-                jobs.append((z, x, y))
+        ranges.append((z, x_min, x_max, y_min, y_max))
+        total += count
 
-    total = len(jobs)
     if total == 0:
         print(f"[done] no jobs for layer={layer.name}")
         return
 
-    # simple rate limiter
+    # simple rate limiter（保持原逻辑；注意：多线程下并非严格精准，但不影响本次修复目标）
     min_interval = 0.0 if qps <= 0 else (1.0 / qps)
     last_t = 0.0
 
@@ -304,13 +303,13 @@ def download_range_for_layer(
         if min_interval <= 0:
             return
         now = time.perf_counter()
-        wait = (last_t + min_interval) - now
-        if wait > 0:
-            time.sleep(wait)
+        wait_s = (last_t + min_interval) - now
+        if wait_s > 0:
+            time.sleep(wait_s)
         last_t = time.perf_counter()
 
     import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
     ok = skip = nf404 = fail = 0
 
@@ -345,29 +344,57 @@ def download_range_for_layer(
                     time.sleep(backoff_s * (i + 1))
             return f"fail:{last}"
 
+        # 任务生成器（流式产出），避免一次性构建 jobs 列表
+        def iter_tasks():
+            for (z, x_min, x_max, y_min, y_max) in ranges:
+                for x in range(x_min, x_max + 1):
+                    for y in range(y_min, y_max + 1):
+                        yield (z, x, y)
+
         print(f"[start] layer={layer.name} jobs={total} out={out_dir}")
+
+        # 控制“在途”future数量，避免 submit 数千万个 future 导致内存爆炸
+        pending_limit = max(concurrency * 200, 1000)
+
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            futs = [ex.submit(fetch_one, z, x, y) for (z, x, y) in jobs]
+            it = iter_tasks()
+            pending = set()
+
+            def submit_more():
+                nonlocal pending
+                while len(pending) < pending_limit:
+                    try:
+                        z, x, y = next(it)
+                    except StopIteration:
+                        break
+                    pending.add(ex.submit(fetch_one, z, x, y))
+
+            submit_more()
+
             done = 0
-            for fu in as_completed(futs):
-                res = fu.result()
-                done += 1
-                if res == "ok":
-                    ok += 1
-                elif res == "skip":
-                    skip += 1
-                elif res == "404":
-                    nf404 += 1
-                else:
-                    fail += 1
+            while pending:
+                done_set, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fu in done_set:
+                    res = fu.result()
+                    done += 1
+                    if res == "ok":
+                        ok += 1
+                    elif res == "skip":
+                        skip += 1
+                    elif res == "404":
+                        nf404 += 1
+                    else:
+                        fail += 1
 
-                if done % 200 == 0 or done == total:
-                    print(f"[prog] {done}/{total} ok={ok} skip={skip} 404={nf404} fail={fail}")
+                    if done % 200 == 0 or done == total:
+                        print(f"[prog] {done}/{total} ok={ok} skip={skip} 404={nf404} fail={fail}")
 
-                if isinstance(res, str) and res.startswith("fail:"):
-                    # 不刷屏：只偶尔打印
-                    if done % 200 == 0:
-                        print(f"[fail] sample: {res}")
+                    if isinstance(res, str) and res.startswith("fail:"):
+                        # 不刷屏：只偶尔打印
+                        if done % 200 == 0:
+                            print(f"[fail] sample: {res}")
+
+                submit_more()
 
         print(f"[finish] layer={layer.name} ok={ok} skip={skip} 404={nf404} fail={fail}")
 
